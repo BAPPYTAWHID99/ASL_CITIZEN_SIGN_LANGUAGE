@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ASL Sign Recognition</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 760px; padding: 0 1rem; }
+    video { background: #111; max-width: 100%; width: 640px; transform: scaleX(-1); }
+    button { font-size: 1rem; margin: 0.75rem 0.5rem 0 0; padding: 0.6rem 1rem; }
+    button:disabled { cursor: not-allowed; opacity: 0.5; }
+    #status { min-height: 1.5rem; }
+    #prediction { font-size: 2rem; font-weight: 700; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>ASL Sign Recognition</h1>
+    <video id="camera" autoplay playsinline muted></video>
+    <p id="status">Starting camera...</p>
+    <p>Buffered frames: <span id="frame-count">0</span> / 200</p>
+    <button id="start-button" type="button">Start Camera</button>
+    <button id="predict-button" type="button" disabled>Predict Word</button>
+    <button id="clear-button" type="button">Clear Buffer</button>
+    <p id="prediction" aria-live="polite"></p>
+  </main>
+
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/holistic/holistic.js"></script>
+  <script>
+    (() => {
+      "use strict";
+
+      const FRAME_COUNT = 200;
+      const LANDMARKS_PER_GROUP = { pose: 33, hand: 21 };
+      const POSITION_FEATURES = 225;
+      const FEATURES_PER_FRAME = 450;
+      const buffer = [];
+      let camera = null;
+      let holistic = null;
+      let processingFrame = false;
+      let lastPosition = null;
+
+      const video = document.getElementById("camera");
+      const status = document.getElementById("status");
+      const frameCount = document.getElementById("frame-count");
+      const predictButton = document.getElementById("predict-button");
+      const startButton = document.getElementById("start-button");
+      const clearButton = document.getElementById("clear-button");
+      const prediction = document.getElementById("prediction");
+
+      function setStatus(message) {
+        status.textContent = message;
+      }
+
+      function zeroLandmarks(count) {
+        return Array.from({ length: count }, () => [0, 0, 0]);
+      }
+
+      function readLandmarks(landmarks, count) {
+        if (!Array.isArray(landmarks) || landmarks.length < count) {
+          return zeroLandmarks(count);
+        }
+        return landmarks.slice(0, count).map((landmark) => [
+          Number.isFinite(landmark.x) ? landmark.x : 0,
+          Number.isFinite(landmark.y) ? landmark.y : 0,
+          Number.isFinite(landmark.z) ? landmark.z : 0
+        ]);
+      }
+
+      function normalizeLandmarks(pose, leftHand, rightHand) {
+        const shoulderLeft = pose[11];
+        const shoulderRight = pose[12];
+        const center = [
+          (shoulderLeft[0] + shoulderRight[0]) / 2,
+          (shoulderLeft[1] + shoulderRight[1]) / 2,
+          (shoulderLeft[2] + shoulderRight[2]) / 2
+        ];
+        const shoulderDistance = Math.hypot(
+          shoulderLeft[0] - shoulderRight[0],
+          shoulderLeft[1] - shoulderRight[1]
+        );
+        const scale = shoulderDistance > 1e-6 ? shoulderDistance : 1;
+        return [...pose, ...leftHand, ...rightHand].flatMap((point) =>
+          point.map((value, axis) => (value - center[axis]) / scale)
+        );
+      }
+
+      function makeFrame(results) {
+        const pose = readLandmarks(results.poseLandmarks, LANDMARKS_PER_GROUP.pose);
+        const leftHand = readLandmarks(
+          results.leftHandLandmarks,
+          LANDMARKS_PER_GROUP.hand
+        );
+        const rightHand = readLandmarks(
+          results.rightHandLandmarks,
+          LANDMARKS_PER_GROUP.hand
+        );
+        const position = normalizeLandmarks(pose, leftHand, rightHand);
+        if (position.length !== POSITION_FEATURES) {
+          throw new Error(`Expected ${POSITION_FEATURES} position features.`);
+        }
+        const velocity = lastPosition === null
+          ? new Array(POSITION_FEATURES).fill(0)
+          : position.map((value, index) => value - lastPosition[index]);
+        lastPosition = position;
+        const frame = position.concat(velocity);
+        if (frame.length !== FEATURES_PER_FRAME) {
+          throw new Error(`Expected ${FEATURES_PER_FRAME} features per frame.`);
+        }
+        return frame;
+      }
+
+      function updateBuffer(frame) {
+        if (buffer.length >= FRAME_COUNT) {
+          buffer.shift();
+        }
+        buffer.push(frame);
+        frameCount.textContent = String(buffer.length);
+        predictButton.disabled = buffer.length !== FRAME_COUNT;
+      }
+
+      async function handleResults(results) {
+        if (processingFrame) {
+          return;
+        }
+        processingFrame = true;
+        try {
+          updateBuffer(makeFrame(results));
+          if (buffer.length === FRAME_COUNT) {
+            setStatus("Ready to predict.");
+          } else {
+            setStatus("Collecting frames...");
+          }
+        } catch (error) {
+          setStatus(`Frame error: ${error.message}`);
+        } finally {
+          processingFrame = false;
+        }
+      }
+
+      function clearBuffer() {
+        buffer.length = 0;
+        lastPosition = null;
+        frameCount.textContent = "0";
+        predictButton.disabled = true;
+        prediction.textContent = "";
+        setStatus("Buffer cleared.");
+      }
+
+      function getCookie(name) {
+        const prefix = `${name}=`;
+        const cookie = document.cookie
+          .split(";")
+          .map((item) => item.trim())
+          .find((item) => item.startsWith(prefix));
+        return cookie ? decodeURIComponent(cookie.slice(prefix.length)) : "";
+      }
+
+      async function predictWord() {
+        if (buffer.length !== FRAME_COUNT) {
+          setStatus(`Exactly ${FRAME_COUNT} frames are required.`);
+          return;
+        }
+        predictButton.disabled = true;
+        setStatus("Predicting...");
+        try {
+          const response = await fetch("/api/predict/", {
+            method: "POST",
+            credentials: "same-origin",
+            headers: {
+              "Content-Type": "application/json",
+              "X-CSRFToken": getCookie("csrftoken")
+            },
+            body: JSON.stringify({ sequence: buffer })
+          });
+          const result = await response.json();
+          if (!response.ok) {
+            throw new Error(result.error || "Prediction request failed.");
+          }
+          prediction.textContent =
+            `${result.word} (${(Number(result.confidence) * 100).toFixed(1)}%)`;
+          setStatus("Prediction complete.");
+        } catch (error) {
+          setStatus(`Prediction error: ${error.message}`);
+        } finally {
+          predictButton.disabled = buffer.length !== FRAME_COUNT;
+        }
+      }
+
+      async function startCamera() {
+        if (camera !== null) {
+          return;
+        }
+        holistic = new Holistic({
+          locateFile: (file) =>
+            `https://cdn.jsdelivr.net/npm/@mediapipe/holistic/${file}`
+        });
+        holistic.setOptions({
+          modelComplexity: 1,
+          smoothLandmarks: true,
+          enableSegmentation: false,
+          smoothSegmentation: false,
+          refineFaceLandmarks: false,
+          minDetectionConfidence: 0.5,
+          minTrackingConfidence: 0.5
+        });
+        holistic.onResults(handleResults);
+        camera = new Camera(video, {
+          onFrame: async () => {
+            await holistic.send({ image: video });
+          },
+          width: 640,
+          height: 480
+        });
+        try {
+          await camera.start();
+          startButton.disabled = true;
+          setStatus("Camera running. Perform a sign to fill the buffer.");
+        } catch (error) {
+          camera = null;
+          setStatus(`Camera error: ${error.message}`);
+        }
+      }
+
+      startButton.addEventListener("click", startCamera);
+      predictButton.addEventListener("click", predictWord);
+      clearButton.addEventListener("click", clearBuffer);
+    })();
+  </script>
+</body>
+</html>

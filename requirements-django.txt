@@ -1,0 +1,4 @@
+Django>=5.0
+djangorestframework>=3.15
+numpy>=1.26
+torch>=2.6
